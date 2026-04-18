@@ -1,0 +1,13 @@
+{
+  "class_diagrams": [
+    {"name": "Order", "attributes": ["id", "amount"], "methods": ["pay", "cancel"]},
+    {"name": "PaymentService", "attributes": ["gateway"], "methods": ["charge", "refund"]}
+  ],
+  "use_cases": [
+    {"actor": "用户", "name": "提交订单"},
+    {"actor": "管理员", "name": "查看度量报告"}
+  ],
+  "flow_charts": [
+    {"name": "订单支付流程", "nodes": 12, "edges": 14}
+  ]
+}
