@@ -19,23 +19,12 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-JAVA_CLASS_RE = re.compile(
-    r"class\s+(?P<name>\w+)(?:\s+extends\s+(?P<parent>\w+))?(?:\s+implements\s+(?P<impl>[\w,\s]+))?",
-    re.MULTILINE,
-)
-
-METHOD_RE = re.compile(
-    r"(?P<scope>public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[\w<>,\[\]]+\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*\{",
-    re.MULTILINE,
-)
-
-FIELD_RE = re.compile(
-    r"(?P<scope>public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[\w<>,\[\]]+\s+(?P<name>\w+)\s*(?:=.*?)?;",
-    re.MULTILINE,
-)
-
-CALL_RE = re.compile(r"(\w+)\.(\w+)\s*\(")
-COMPLEXITY_TOKENS = re.compile(r"\b(if|for|while|case|catch|\?|&&|\|\|)\b")
+from src.ast_parser import ASTParser
+from src.loc_counter import LoCCounter
+from src.cyclomatic_complexity import CyclomaticComplexityCalculator
+from src.ck_metrics import CKMetricsCalculator
+from src.code_statistics import CodeStatistics
+from src.method_length import MethodLengthCalculator
 
 
 @dataclass
@@ -58,106 +47,6 @@ class ClassMetrics:
         data = asdict(self)
         data["lcom"] = round(self.lcom, 3)
         return data
-
-
-def strip_comments(code: str) -> str:
-    code = re.sub(r"//.*", "", code)
-    code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
-    return code
-
-
-def count_loc(code: str) -> int:
-    return sum(1 for line in code.splitlines() if line.strip())
-
-
-def estimate_complexity(code: str) -> int:
-    base = 1
-    return base + len(COMPLEXITY_TOKENS.findall(code))
-
-
-def parse_java_file(path: Path) -> Tuple[ClassMetrics | None, str, int]:
-    raw = path.read_text(encoding="utf-8")
-    code = strip_comments(raw)
-
-    class_match = JAVA_CLASS_RE.search(code)
-    if not class_match:
-        return None, code, count_loc(code)
-
-    class_name = class_match.group("name")
-    parent = class_match.group("parent")
-    metrics = ClassMetrics(name=class_name, parent=parent)
-
-    methods = METHOD_RE.finditer(code)
-    method_spans: List[Tuple[int, int, str]] = []
-    for m in methods:
-        metrics.methods += 1
-        scope = (m.group("scope") or "").strip()
-        if scope == "public":
-            metrics.public_methods += 1
-        method_spans.append((m.start(), m.end(), m.group("name")))
-
-    fields = FIELD_RE.finditer(code)
-    for _ in fields:
-        metrics.fields += 1
-
-    metrics.complexity = estimate_complexity(code)
-
-    calls = CALL_RE.findall(code)
-    metrics.mpc = len(calls)
-    called_objects = {obj for obj, _ in calls if obj not in {"this", "super"}}
-    metrics.cbo = len(called_objects)
-    metrics.rfc = metrics.methods + len({name for _, name in calls})
-
-    # 近似 LCOM：基于字段与方法标识符是否同名引用
-    field_names = {f.group("name") for f in FIELD_RE.finditer(code)}
-    method_bodies = extract_method_bodies(code)
-    if metrics.methods > 1 and field_names:
-        share = 0
-        non_share = 0
-        names = list(method_bodies.keys())
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                fi = used_fields(field_names, method_bodies[names[i]])
-                fj = used_fields(field_names, method_bodies[names[j]])
-                if fi & fj:
-                    share += 1
-                else:
-                    non_share += 1
-        metrics.lcom = max(non_share - share, 0) / max(non_share + share, 1)
-
-    # DAC: Data Abstraction Coupling（近似）
-    primitive = {"int", "long", "double", "float", "boolean", "char", "byte", "short", "String"}
-    type_refs = set(re.findall(r"\b([A-Z]\w*)\b", code))
-    metrics.dac = len({t for t in type_refs if t not in primitive and t != class_name})
-
-    return metrics, code, count_loc(code)
-
-
-def extract_method_bodies(code: str) -> Dict[str, str]:
-    bodies = {}
-    for m in METHOD_RE.finditer(code):
-        name = m.group("name")
-        start = m.end() - 1
-        brace = 0
-        end = start
-        for idx in range(start, len(code)):
-            if code[idx] == "{":
-                brace += 1
-            elif code[idx] == "}":
-                brace -= 1
-                if brace == 0:
-                    end = idx
-                    break
-        bodies[name] = code[start:end + 1]
-    return bodies
-
-
-def used_fields(field_names: Set[str], body: str) -> Set[str]:
-    used = set()
-    for field in field_names:
-        if re.search(rf"\b{re.escape(field)}\b", body):
-            used.add(field)
-    return used
 
 
 def compute_hierarchy_metrics(classes: Dict[str, ClassMetrics]) -> None:
@@ -233,13 +122,80 @@ def find_java_files(input_dir: Path) -> List[Path]:
     return sorted(input_dir.rglob("*.java"))
 
 
+def parse_java_file_with_ast(path: Path) -> Tuple[ClassMetrics | None, str, int]:
+    """使用AST解析Java文件
+    
+    Args:
+        path: Java文件路径
+        
+    Returns:
+        (ClassMetrics, 代码内容, 代码行数)
+    """
+    ast_parser = ASTParser()
+    loc_counter = LoCCounter()
+    cc_calculator = CyclomaticComplexityCalculator()
+    ck_calculator = CKMetricsCalculator()
+    
+    # 解析文件结构
+    structure = ast_parser.parse_file(path)
+    if not structure or not structure['classes']:
+        # 如果解析失败，返回空
+        code = path.read_text(encoding="utf-8")
+        loc = loc_counter.count_file(path)['code']
+        return None, code, loc
+    
+    # 获取第一个类的信息
+    class_info = structure['classes'][0]
+    class_name = class_info['name']
+    parent = class_info.get('parent')
+    
+    # 创建ClassMetrics对象
+    metrics = ClassMetrics(name=class_name, parent=parent)
+    
+    # 统计方法和字段
+    metrics.methods = len(class_info.get('methods', []))
+    metrics.fields = len(class_info.get('fields', []))
+    
+    # 统计公共方法
+    for method in class_info.get('methods', []):
+        if 'public' in method.get('modifiers', []):
+            metrics.public_methods += 1
+    
+    # 计算圈复杂度
+    complexity = cc_calculator.calculate_file_complexity(path)
+    if class_name in complexity:
+        metrics.complexity = complexity[class_name]['total_complexity']
+    
+    # 计算CK指标
+    ck_metrics = ck_calculator.calculate_file_metrics(path)
+    if class_name in ck_metrics:
+        metrics.cbo = ck_metrics[class_name]['cbo']
+        metrics.rfc = ck_metrics[class_name]['rfc']
+        metrics.lcom = ck_metrics[class_name]['lcom']
+    
+    # 计算其他指标（MPC、DAC）
+    code = path.read_text(encoding="utf-8")
+    calls = re.findall(r"(\w+)\.(\w+)\s*\(", code)
+    metrics.mpc = len(calls)
+    
+    # DAC: Data Abstraction Coupling（近似）
+    primitive = {"int", "long", "double", "float", "boolean", "char", "byte", "short", "String"}
+    type_refs = set(re.findall(r"\b([A-Z]\w*)\b", code))
+    metrics.dac = len({t for t in type_refs if t not in primitive and t != class_name})
+    
+    # 统计代码行数
+    loc = loc_counter.count_file(path)['code']
+    
+    return metrics, code, loc
+
+
 def build_report(source_dir: Path, design_file: Path | None, persons: int, hourly_rate: float) -> Dict:
     java_files = find_java_files(source_dir)
     class_metrics: Dict[str, ClassMetrics] = {}
     total_loc = 0
 
     for file in java_files:
-        cm, _, loc = parse_java_file(file)
+        cm, _, loc = parse_java_file_with_ast(file)
         total_loc += loc
         if cm:
             class_metrics[cm.name] = cm

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.metrics_tool import build_report, parse_java_file
+from src.metrics_tool import build_report, parse_java_file_with_ast
 
 
 def test_parse_java_file_basic(tmp_path: Path):
@@ -14,7 +14,7 @@ def test_parse_java_file_basic(tmp_path: Path):
     f = tmp_path / 'A.java'
     f.write_text(code, encoding='utf-8')
 
-    cm, _, loc = parse_java_file(f)
+    cm, _, loc = parse_java_file_with_ast(f)
     assert cm is not None
     assert cm.name == 'A'
     assert cm.parent == 'B'
