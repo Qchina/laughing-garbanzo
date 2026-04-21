@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+.idea/
+.smoke_tmp/
+metrics_dashboard.html
+metrics_report_visual.json
