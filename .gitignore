@@ -4,3 +4,4 @@ __pycache__/
 .smoke_tmp/
 metrics_dashboard.html
 metrics_report_visual.json
+.gui_history.json
