@@ -8,9 +8,13 @@ Chinese UI strings are injected via unicode escapes.
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -44,7 +48,11 @@ TXT = {
     "person_hours": "\u603b\u5de5\u65f6",
     "cost": "\u4f30\u7b97\u6210\u672c",
     "duration_staff": "\u5f53\u524d\u4eba\u5458\u914d\u7f6e\u4e0b\u5468\u671f",
-    "footer": "\u7531 C \u540c\u5b66\u5c55\u793a\u5c42\u5de5\u5177\u81ea\u52a8\u751f\u6210\uff0c\u53ef\u7528\u4e8e\u8bfe\u7a0b\u5b9e\u9a8c\u5c55\u793a\u4e0e\u7b54\u8fa9\u3002",
+    "ai_section": "AI Agent \u5206\u6790\u7ed3\u679c",
+    "ai_model": "AI \u6a21\u578b",
+    "ai_status": "AI \u72b6\u6001",
+    "ai_generated": "AI \u751f\u6210\u65f6\u95f4",
+    "ai_unavailable": "AI \u5206\u6790\u672a\u542f\u7528\u6216\u6682\u4e0d\u53ef\u7528\u3002",
     "json_ok": "\u5df2\u751f\u6210 JSON \u62a5\u544a",
     "html_ok": "\u5df2\u751f\u6210 HTML \u53ef\u89c6\u5316\u9875\u9762",
 }
@@ -244,11 +252,175 @@ def _top_classes(classes: List[Dict], key: str, top_n: int = 10) -> List[Dict]:
     return sorted(classes, key=lambda x: x.get(key, 0), reverse=True)[:top_n]
 
 
+def _build_ai_prompt(report: Dict, source_label: str) -> str:
+    project = report.get("project", {})
+    estimation = report.get("estimation", {})
+    classes = report.get("classes", [])
+    top_wmc = _top_classes(classes, "complexity", top_n=5)
+    top_cbo = _top_classes(classes, "cbo", top_n=5)
+    payload = {
+        "source": source_label,
+        "project": project,
+        "estimation": estimation,
+        "top_wmc": [
+            {"name": c.get("name"), "wmc": c.get("complexity"), "cbo": c.get("cbo"), "rfc": c.get("rfc"), "lcom": c.get("lcom")}
+            for c in top_wmc
+        ],
+        "top_cbo": [
+            {"name": c.get("name"), "cbo": c.get("cbo"), "wmc": c.get("complexity"), "rfc": c.get("rfc"), "dit": c.get("dit")}
+            for c in top_cbo
+        ],
+    }
+    return (
+        "You are a senior software quality agent. "
+        "Write a concise analysis in Chinese. "
+        "Use 4 sections with short headings: 1) Overall quality judgement 2) Key risks 3) Refactoring priorities 4) Next sprint actions. "
+        "Keep it practical and concrete. Avoid hallucinating code details that are not in input.\n\n"
+        "Input JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _extract_response_text(response: Dict) -> str:
+    text = response.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    output = response.get("output", [])
+    for item in output:
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                value = content.get("text", "")
+                if value and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _extract_chat_text(response: Dict) -> str:
+    choices = response.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _post_json(url: str, headers: Dict[str, str], payload: Dict, timeout_sec: int) -> Dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=max(timeout_sec, 5)) as resp:
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw)
+
+
+def _run_ai_analysis(
+    report: Dict,
+    source_label: str,
+    model: str,
+    timeout_sec: int,
+    api_base_url: str,
+    api_mode: str,
+) -> Dict:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "enabled": False,
+            "status": "skipped",
+            "reason": "missing_api_key",
+            "model": model,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "content": "No OPENAI_API_KEY found. AI analysis skipped.",
+        }
+
+    prompt = _build_ai_prompt(report, source_label)
+    base = api_base_url.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    if api_mode == "chat-completions":
+        url = f"{base}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a senior software quality analysis agent."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+        }
+    else:
+        url = f"{base}/responses"
+        payload = {
+            "model": model,
+            "input": prompt,
+            "temperature": 0.3,
+        }
+
+    try:
+        body = _post_json(url=url, headers=headers, payload=payload, timeout_sec=timeout_sec)
+        if api_mode == "chat-completions":
+            content = _extract_chat_text(body) or "AI response is empty."
+        else:
+            content = _extract_response_text(body) or "AI response is empty."
+        return {
+            "enabled": True,
+            "status": "ok",
+            "reason": "",
+            "model": model,
+            "api_mode": api_mode,
+            "api_base_url": api_base_url,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "content": content,
+        }
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            detail = str(exc)
+        return {
+            "enabled": True,
+            "status": "failed",
+            "reason": f"http_{exc.code}",
+            "model": model,
+            "api_mode": api_mode,
+            "api_base_url": api_base_url,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "content": f"AI request failed: HTTP {exc.code}. {detail[:500]}",
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "status": "failed",
+            "reason": "runtime_error",
+            "model": model,
+            "api_mode": api_mode,
+            "api_base_url": api_base_url,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "content": f"AI request failed: {exc}",
+        }
+
+
 def generate_html(report: Dict, source_label: str) -> str:
     project = report.get("project", {})
     estimation = report.get("estimation", {})
     classes = report.get("classes", [])
     quality = report.get("quality_analysis") or _derive_quality_analysis(report)
+    ai_analysis = report.get("ai_analysis", {})
 
     thresholds = quality.get("thresholds", {})
     risky_classes = quality.get("risky_classes", [])
@@ -260,6 +432,11 @@ def generate_html(report: Dict, source_label: str) -> str:
     top_wmc = _top_classes(classes, "complexity")
     top_cbo = _top_classes(classes, "cbo")
     generated_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ai_content = str(ai_analysis.get("content", "")).strip()
+    ai_model = str(ai_analysis.get("model", "N/A"))
+    ai_status = str(ai_analysis.get("status", "skipped"))
+    ai_generated = str(ai_analysis.get("generated_at", "-"))
+    ai_html = html.escape(ai_content).replace("\n", "<br>") if ai_content else TXT["ai_unavailable"]
 
     risky_rows = "".join(
         f"<tr><td>{item.get('class')}</td><td><span class='badge {item.get('severity')}'>{item.get('severity')}</span></td><td>{', '.join(item.get('reasons', []))}</td><td>{item.get('suggestion')}</td></tr>"
@@ -305,8 +482,12 @@ def generate_html(report: Dict, source_label: str) -> str:
     .badge {{ display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 0.76rem; color: #fff; }}
     .badge.high {{ background: var(--danger); }}
     .badge.medium {{ background: var(--warn); color: #333; }}
+    .badge.ai-ok {{ background: #0a9396; }}
+    .badge.ai-failed {{ background: #bb3e03; }}
+    .badge.ai-skipped {{ background: #94a3b8; }}
+    .ai-panel {{ white-space: normal; line-height: 1.65; color: #1f2a44; }}
+    .ai-meta {{ color: var(--muted); font-size: 0.84rem; margin-bottom: 10px; }}
     .list {{ margin: 0; padding-left: 18px; }}
-    .footer {{ margin-top: 16px; color: var(--muted); font-size: 0.84rem; }}
     @media (max-width: 980px) {{ .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .section {{ grid-template-columns: 1fr; }} }}
     @media (max-width: 560px) {{ .grid {{ grid-template-columns: 1fr; }} }}
   </style>
@@ -371,7 +552,17 @@ def generate_html(report: Dict, source_label: str) -> str:
         </ul>
       </article>
     </section>
-    <div class="footer">{TXT['footer']}</div>
+    <section class="section">
+      <article class="card" style="grid-column: 1 / -1;">
+        <h2>{TXT['ai_section']}</h2>
+        <div class="ai-meta">
+          {TXT['ai_model']}: {html.escape(ai_model)} |
+          {TXT['ai_status']}: <span class="badge ai-{'ok' if ai_status == 'ok' else ('failed' if ai_status == 'failed' else 'skipped')}">{html.escape(ai_status)}</span> |
+          {TXT['ai_generated']}: {html.escape(ai_generated)}
+        </div>
+        <div class="ai-panel">{ai_html}</div>
+      </article>
+    </section>
   </div>
   <script>
     const classNames = {_json_js(class_names)};
@@ -397,7 +588,37 @@ def generate_html(report: Dict, source_label: str) -> str:
 """
 
 
-def generate_dashboard(report: Dict, output_json: Path, output_html: Path, source_label: str) -> None:
+def generate_dashboard(
+    report: Dict,
+    output_json: Path,
+    output_html: Path,
+    source_label: str,
+    ai_model: str,
+    ai_timeout: int,
+    disable_ai: bool,
+    ai_base_url: str,
+    ai_api_mode: str,
+) -> None:
+    if not disable_ai:
+        report["ai_analysis"] = _run_ai_analysis(
+            report,
+            source_label=source_label,
+            model=ai_model,
+            timeout_sec=ai_timeout,
+            api_base_url=ai_base_url,
+            api_mode=ai_api_mode,
+        )
+    else:
+        report["ai_analysis"] = {
+            "enabled": False,
+            "status": "skipped",
+            "reason": "disabled_by_flag",
+            "model": ai_model,
+            "api_mode": ai_api_mode,
+            "api_base_url": ai_base_url,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "content": "AI analysis disabled by --disable-ai-analysis.",
+        }
     output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     output_html.write_text(generate_html(report, source_label), encoding="utf-8")
 
@@ -409,6 +630,20 @@ def main() -> None:
     parser.add_argument("--design", help="Design input JSON file.")
     parser.add_argument("--persons", type=int, default=4, help="Team size for estimation.")
     parser.add_argument("--hourly-rate", type=float, default=120.0, help="Hourly labor cost.")
+    parser.add_argument("--ai-model", default=os.getenv("OPENAI_MODEL", "gpt-5.2"), help="Model name for AI analysis.")
+    parser.add_argument("--ai-timeout", type=int, default=45, help="AI request timeout in seconds.")
+    parser.add_argument(
+        "--ai-base-url",
+        default=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        help="AI API base URL. Example: https://api.openai.com/v1 or https://ark.cn-beijing.volces.com/api/v3",
+    )
+    parser.add_argument(
+        "--ai-api-mode",
+        choices=["responses", "chat-completions"],
+        default=os.getenv("AI_API_MODE", "responses"),
+        help="API style for AI call.",
+    )
+    parser.add_argument("--disable-ai-analysis", action="store_true", help="Disable AI analysis module.")
     parser.add_argument("--json-output", default="metrics_report_visual.json", help="Output JSON path.")
     parser.add_argument("--html-output", default="metrics_dashboard.html", help="Output HTML path.")
     args = parser.parse_args()
@@ -427,7 +662,17 @@ def main() -> None:
         hourly_rate=args.hourly_rate,
     )
     source_label = str(source) if source else (str(input_json) if input_json else "N/A")
-    generate_dashboard(report, output_json=output_json, output_html=output_html, source_label=source_label)
+    generate_dashboard(
+        report,
+        output_json=output_json,
+        output_html=output_html,
+        source_label=source_label,
+        ai_model=args.ai_model,
+        ai_timeout=args.ai_timeout,
+        disable_ai=args.disable_ai_analysis,
+        ai_base_url=args.ai_base_url,
+        ai_api_mode=args.ai_api_mode,
+    )
     print(f"{TXT['json_ok']}: {output_json}")
     print(f"{TXT['html_ok']}: {output_html}")
 
