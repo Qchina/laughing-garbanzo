@@ -10,14 +10,17 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import os
 import re
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from src.agent_analyzer import AgentAnalyzer
 
 
 TXT = {
@@ -252,167 +255,59 @@ def _top_classes(classes: List[Dict], key: str, top_n: int = 10) -> List[Dict]:
     return sorted(classes, key=lambda x: x.get(key, 0), reverse=True)[:top_n]
 
 
-def _build_ai_prompt(report: Dict, source_label: str) -> str:
-    project = report.get("project", {})
-    estimation = report.get("estimation", {})
-    classes = report.get("classes", [])
-    top_wmc = _top_classes(classes, "complexity", top_n=5)
-    top_cbo = _top_classes(classes, "cbo", top_n=5)
-    payload = {
-        "source": source_label,
-        "project": project,
-        "estimation": estimation,
-        "top_wmc": [
-            {"name": c.get("name"), "wmc": c.get("complexity"), "cbo": c.get("cbo"), "rfc": c.get("rfc"), "lcom": c.get("lcom")}
-            for c in top_wmc
-        ],
-        "top_cbo": [
-            {"name": c.get("name"), "cbo": c.get("cbo"), "wmc": c.get("complexity"), "rfc": c.get("rfc"), "dit": c.get("dit")}
-            for c in top_cbo
-        ],
-    }
-    return (
-        "You are a senior software quality agent. "
-        "Write a concise analysis in Chinese. "
-        "Use 4 sections with short headings: 1) Overall quality judgement 2) Key risks 3) Refactoring priorities 4) Next sprint actions. "
-        "Keep it practical and concrete. Avoid hallucinating code details that are not in input.\n\n"
-        "Input JSON:\n"
-        f"{json.dumps(payload, ensure_ascii=False)}"
-    )
-
-
-def _extract_response_text(response: Dict) -> str:
-    text = response.get("output_text")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    output = response.get("output", [])
-    for item in output:
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                value = content.get("text", "")
-                if value and value.strip():
-                    return value.strip()
-    return ""
-
-
-def _extract_chat_text(response: Dict) -> str:
-    choices = response.get("choices", [])
-    if not choices:
+def _format_fallback(fallback: Dict) -> str:
+    if not isinstance(fallback, dict):
         return ""
-    message = choices[0].get("message", {})
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                txt = item.get("text")
-                if isinstance(txt, str) and txt.strip():
-                    parts.append(txt.strip())
-        return "\n".join(parts).strip()
-    return ""
+    summary = str(fallback.get("summary", "")).strip()
+    recs = fallback.get("recommendations", [])
+    lines = [summary] if summary else []
+    if isinstance(recs, list) and recs:
+        lines.append("")
+        lines.append("建议：")
+        lines.extend([f"- {str(item)}" for item in recs[:6]])
+    return "\n".join(lines).strip()
 
 
-def _post_json(url: str, headers: Dict[str, str], payload: Dict, timeout_sec: int) -> Dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=max(timeout_sec, 5)) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw)
+def _run_ai_analysis(report: Dict, use_ai: bool, api_provider: str) -> Dict:
+    analyzer = AgentAnalyzer(api_provider=api_provider)
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
-def _run_ai_analysis(
-    report: Dict,
-    source_label: str,
-    model: str,
-    timeout_sec: int,
-    api_base_url: str,
-    api_mode: str,
-) -> Dict:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return {
-            "enabled": False,
-            "status": "skipped",
-            "reason": "missing_api_key",
-            "model": model,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "content": "No OPENAI_API_KEY found. AI analysis skipped.",
-        }
-
-    prompt = _build_ai_prompt(report, source_label)
-    base = api_base_url.rstrip("/")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    if api_mode == "chat-completions":
-        url = f"{base}/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You are a senior software quality analysis agent."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-        }
-    else:
-        url = f"{base}/responses"
-        payload = {
-            "model": model,
-            "input": prompt,
-            "temperature": 0.3,
-        }
-
-    try:
-        body = _post_json(url=url, headers=headers, payload=payload, timeout_sec=timeout_sec)
-        if api_mode == "chat-completions":
-            content = _extract_chat_text(body) or "AI response is empty."
-        else:
-            content = _extract_response_text(body) or "AI response is empty."
+    if use_ai:
+        ai_result = analyzer.analyze_with_ai(report)
+        if ai_result.get("success"):
+            return {
+                "enabled": True,
+                "status": "ok",
+                "reason": "",
+                "model": "agent_analyzer",
+                "provider": ai_result.get("provider", api_provider),
+                "generated_at": generated_at,
+                "content": str(ai_result.get("analysis", "")).strip() or TXT["ai_unavailable"],
+            }
+        fallback_text = _format_fallback(ai_result.get("fallback", {}))
+        err = str(ai_result.get("error", "AI analysis failed"))
+        content = f"{err}\n\n{fallback_text}".strip() if fallback_text else err
         return {
             "enabled": True,
-            "status": "ok",
-            "reason": "",
-            "model": model,
-            "api_mode": api_mode,
-            "api_base_url": api_base_url,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "failed",
+            "reason": "agent_error",
+            "model": "agent_analyzer",
+            "provider": api_provider,
+            "generated_at": generated_at,
             "content": content,
         }
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", errors="ignore")
-        except Exception:
-            detail = str(exc)
-        return {
-            "enabled": True,
-            "status": "failed",
-            "reason": f"http_{exc.code}",
-            "model": model,
-            "api_mode": api_mode,
-            "api_base_url": api_base_url,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "content": f"AI request failed: HTTP {exc.code}. {detail[:500]}",
-        }
-    except Exception as exc:
-        return {
-            "enabled": True,
-            "status": "failed",
-            "reason": "runtime_error",
-            "model": model,
-            "api_mode": api_mode,
-            "api_base_url": api_base_url,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "content": f"AI request failed: {exc}",
-        }
+
+    rule_result = analyzer.analyze_metrics(report).to_dict()
+    content = _format_fallback(rule_result) or "Rule-based analysis completed."
+    return {
+        "enabled": True,
+        "status": "ok",
+        "reason": "rule_only",
+        "model": "agent_analyzer",
+        "provider": api_provider,
+        "generated_at": generated_at,
+        "content": content,
+    }
 
 
 def generate_html(report: Dict, source_label: str) -> str:
@@ -593,29 +488,19 @@ def generate_dashboard(
     output_json: Path,
     output_html: Path,
     source_label: str,
-    ai_model: str,
-    ai_timeout: int,
+    use_ai: bool,
     disable_ai: bool,
-    ai_base_url: str,
-    ai_api_mode: str,
+    api_provider: str,
 ) -> None:
     if not disable_ai:
-        report["ai_analysis"] = _run_ai_analysis(
-            report,
-            source_label=source_label,
-            model=ai_model,
-            timeout_sec=ai_timeout,
-            api_base_url=ai_base_url,
-            api_mode=ai_api_mode,
-        )
+        report["ai_analysis"] = _run_ai_analysis(report, use_ai=use_ai, api_provider=api_provider)
     else:
         report["ai_analysis"] = {
             "enabled": False,
             "status": "skipped",
             "reason": "disabled_by_flag",
-            "model": ai_model,
-            "api_mode": ai_api_mode,
-            "api_base_url": ai_base_url,
+            "model": "agent_analyzer",
+            "provider": api_provider,
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "content": "AI analysis disabled by --disable-ai-analysis.",
         }
@@ -630,19 +515,8 @@ def main() -> None:
     parser.add_argument("--design", help="Design input JSON file.")
     parser.add_argument("--persons", type=int, default=4, help="Team size for estimation.")
     parser.add_argument("--hourly-rate", type=float, default=120.0, help="Hourly labor cost.")
-    parser.add_argument("--ai-model", default=os.getenv("OPENAI_MODEL", "gpt-5.2"), help="Model name for AI analysis.")
-    parser.add_argument("--ai-timeout", type=int, default=45, help="AI request timeout in seconds.")
-    parser.add_argument(
-        "--ai-base-url",
-        default=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1"),
-        help="AI API base URL. Example: https://api.openai.com/v1 or https://ark.cn-beijing.volces.com/api/v3",
-    )
-    parser.add_argument(
-        "--ai-api-mode",
-        choices=["responses", "chat-completions"],
-        default=os.getenv("AI_API_MODE", "responses"),
-        help="API style for AI call.",
-    )
+    parser.add_argument("--use-ai", action="store_true", help="Use AgentAnalyzer AI deep analysis.")
+    parser.add_argument("--api-provider", choices=["deepseek", "openai"], default="deepseek", help="AI provider for AgentAnalyzer.")
     parser.add_argument("--disable-ai-analysis", action="store_true", help="Disable AI analysis module.")
     parser.add_argument("--json-output", default="metrics_report_visual.json", help="Output JSON path.")
     parser.add_argument("--html-output", default="metrics_dashboard.html", help="Output HTML path.")
@@ -667,11 +541,9 @@ def main() -> None:
         output_json=output_json,
         output_html=output_html,
         source_label=source_label,
-        ai_model=args.ai_model,
-        ai_timeout=args.ai_timeout,
+        use_ai=args.use_ai,
         disable_ai=args.disable_ai_analysis,
-        ai_base_url=args.ai_base_url,
-        ai_api_mode=args.ai_api_mode,
+        api_provider=args.api_provider,
     )
     print(f"{TXT['json_ok']}: {output_json}")
     print(f"{TXT['html_ok']}: {output_html}")
